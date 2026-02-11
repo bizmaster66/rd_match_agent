@@ -261,8 +261,9 @@ def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool =
         "형식: [{\"idx\":123, \"score\":87, \"rationale\":\"...\", \"evidence_fields\":[\"연구개발내용\", \"대표과제명\"]}]\n"
         "조건:\n"
         "- score는 0~100 정수\n"
-        "- rationale은 한국어 1~2문장\n"
+        "- rationale은 한국어 1문장(60자 이내)\n"
         "- evidence_fields는 다음 중에서만 선택: 대표과제명, 연구목표요약, 연구개발내용, 기대효과요약\n"
+        "- evidence_fields는 최대 2개만 포함\n"
     )
     if strict:
         prompt += (
@@ -317,7 +318,7 @@ def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str, top_n: i
     raw_debug = []
     for start in range(0, len(candidates), batch_size):
         chunk = candidates.iloc[start : start + batch_size]
-        chunk_top = min(top_n, len(chunk))
+        chunk_top = min(top_n, len(chunk), batch_size)
         prompt = make_prompt(query, chunk, top_n=chunk_top, strict=False)
         try:
             response = _call(prompt)
@@ -437,7 +438,7 @@ with col2:
 with st.expander("고급 설정", expanded=False):
     candidate_k = st.slider("1차 후보 수(K)", min_value=50, max_value=500, value=200, step=10)
     rerank_m = st.slider("LLM 재랭킹 개수", min_value=20, max_value=100, value=40, step=5)
-    rerank_batch = st.slider("LLM 배치 크기", min_value=5, max_value=20, value=10, step=1)
+    rerank_batch = st.slider("LLM 배치 크기", min_value=3, max_value=15, value=5, step=1)
     st.markdown("필드 가중치")
     w_title = st.number_input("대표과제명", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
     w_goal = st.number_input("연구목표요약", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
@@ -474,7 +475,7 @@ if run:
         cand = cand.sort_values("_tfidf_score", ascending=False)
 
         # rerank
-        max_m = max(top_n * 3, top_n + 10)
+        max_m = max(top_n * 2, top_n + 10)
         if rerank_m > max_m:
             st.info(f"LLM 재랭킹 후보 수를 {max_m}개로 제한했습니다(출력 안정성).")
         m = min(rerank_m, len(cand), max_m)

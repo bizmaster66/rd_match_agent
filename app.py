@@ -275,6 +275,94 @@ def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool =
     return prompt
 
 
+def make_keyword_prompt(query: str) -> str:
+    prompt = (
+        "너는 입력 과제에서 핵심 키워드를 추출하고 동의어/유의어를 제시하는 역할이다.\n"
+        f"입력 과제: \"{query}\"\n"
+        "다음 JSON 형식으로만 출력하라.\n"
+        "{\"keywords\": [\"...\", \"...\"], \"synonyms\": {\"키워드1\": [\"...\", \"...\"]}}\n"
+        "조건:\n"
+        "- keywords는 1~3개\n"
+        "- 한국어 중심, 의미상 핵심 단어만\n"
+        "- synonyms는 각 키워드당 0~4개, 너무 일반적인 단어는 제외\n"
+    )
+    return prompt
+
+
+def extract_keywords_with_llm(query: str, api_key: str):
+    if genai is None:
+        return [], {}
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    try:
+        response = model.generate_content(
+            make_keyword_prompt(query),
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=512,
+                response_mime_type="application/json",
+            ),
+        )
+    except TypeError:
+        response = model.generate_content(
+            make_keyword_prompt(query),
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=512,
+            ),
+        )
+    raw = _response_text(response)
+    try:
+        data = json.loads(raw)
+        keywords = [safe_text(k) for k in data.get("keywords", []) if safe_text(k)]
+        synonyms = data.get("synonyms", {}) if isinstance(data.get("synonyms", {}), dict) else {}
+        # normalize synonyms
+        syn_norm = {}
+        for k, vals in synonyms.items():
+            if not safe_text(k):
+                continue
+            if isinstance(vals, list):
+                syn_norm[safe_text(k)] = [safe_text(v) for v in vals if safe_text(v)]
+        return keywords[:3], syn_norm
+    except Exception:
+        return [], {}
+
+
+def keyword_bonus_scores(df: pd.DataFrame, keywords: list, synonyms: dict, per_keyword_bonus: float):
+    if not keywords:
+        return np.zeros(len(df), dtype=float)
+
+    # Build search terms
+    terms = []
+    for k in keywords:
+        terms.append(k)
+        for s in synonyms.get(k, []):
+            terms.append(s)
+
+    terms = [t for t in terms if t]
+    if not terms:
+        return np.zeros(len(df), dtype=float)
+
+    combined = (
+        df["대표과제명"].fillna("")
+        + " "
+        + df["연구목표요약"].fillna("")
+        + " "
+        + df["연구개발내용"].fillna("")
+        + " "
+        + df["기대효과요약"].fillna("")
+    ).astype(str)
+
+    bonuses = np.zeros(len(df), dtype=float)
+    for k in keywords:
+        candidates = [k] + synonyms.get(k, [])
+        pattern = "|".join([re.escape(t) for t in candidates if t])
+        if not pattern:
+            continue
+        mask = combined.str.contains(pattern, case=False, regex=True)
+        bonuses[mask.values] += per_keyword_bonus
+
+    return bonuses
 def _response_text(response) -> str:
     if response is None:
         return ""
@@ -441,6 +529,7 @@ with st.expander("고급 설정", expanded=False):
     candidate_k = st.slider("1차 후보 수(K)", min_value=50, max_value=500, value=200, step=10)
     rerank_m = st.slider("LLM 재랭킹 개수", min_value=20, max_value=100, value=40, step=5)
     rerank_batch = st.slider("LLM 배치 크기", min_value=3, max_value=15, value=5, step=1)
+    keyword_bonus = st.slider("키워드 포함 가산점", min_value=0, max_value=30, value=10, step=1)
     st.markdown("필드 가중치")
     w_title = st.number_input("대표과제명", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
     w_goal = st.number_input("연구목표요약", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
@@ -462,11 +551,18 @@ if run:
     for input_id, query in enumerate(inputs, start=1):
         st.write(f"처리 중: 입력 {input_id}")
         query_norm = preprocess_query(query)
+        keywords, synonyms = extract_keywords_with_llm(query_norm, api_key)
+        if keywords:
+            st.caption(f"핵심 키워드: {', '.join(keywords)}")
         scores, per_field_scores = compute_weighted_scores(
             query_norm, vectorizers, matrices, word_vec, word_X, weights
         )
         if scores.size == 0:
             continue
+
+        # keyword bonus (hard signal)
+        bonuses = keyword_bonus_scores(df, keywords, synonyms, per_keyword_bonus=keyword_bonus)
+        scores = scores + bonuses
 
         # candidate selection
         k = min(candidate_k, len(df))

@@ -66,6 +66,29 @@ def extract_json_array(text: str):
         return None
 
 
+def tokenize_simple(text: str):
+    text = safe_text(text)
+    if not text:
+        return []
+    return re.findall(r"[A-Za-z0-9]+|[가-힣]+", text)
+
+
+def preprocess_query(query: str) -> str:
+    q = safe_text(query)
+    if not q:
+        return q
+    # Remove quotes/brackets and normalize separators
+    q = re.sub(r"[\\[\\]\"']", " ", q)
+    q = re.sub(r"[,:/|]+", " ", q)
+    q = re.sub(r"\\s+", " ", q).strip()
+
+    # If user provided comma-separated keywords, append a compact token string
+    tokens = tokenize_simple(q)
+    if tokens:
+        q = f\"{q} \" + \" \".join(tokens)
+    return q
+
+
 @st.cache_data(show_spinner=False)
 def load_rnd_data(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=0)
@@ -83,7 +106,7 @@ def load_rnd_data(file_bytes: bytes) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False)
 def build_index(file_hash: str, df: pd.DataFrame):
-    # Use char n-grams to better capture Korean text similarity
+    # Use char n-grams to better capture Korean text similarity per field
     vectorizers = {}
     matrices = {}
 
@@ -99,10 +122,29 @@ def build_index(file_hash: str, df: pd.DataFrame):
         vectorizers[col] = vec
         matrices[col] = X
 
-    return vectorizers, matrices
+    # Combined word-level index for keyword-heavy queries
+    combined = (
+        df["대표과제명"].fillna("")
+        + " "
+        + df["연구목표요약"].fillna("")
+        + " "
+        + df["연구개발내용"].fillna("")
+        + " "
+        + df["기대효과요약"].fillna("")
+    ).astype(str).tolist()
+
+    word_vec = TfidfVectorizer(
+        tokenizer=tokenize_simple,
+        lowercase=False,
+        max_features=80000,
+    )
+    word_X = word_vec.fit_transform(combined)
+    word_X = normalize(word_X)
+
+    return vectorizers, matrices, word_vec, word_X
 
 
-def compute_weighted_scores(query: str, vectorizers, matrices, weights):
+def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X, weights):
     scores = None
     for col, weight in weights.items():
         vec = vectorizers[col]
@@ -117,8 +159,16 @@ def compute_weighted_scores(query: str, vectorizers, matrices, weights):
             scores += weight * col_scores
 
     if scores is None:
-        return np.array([])
-    return scores
+        scores = np.zeros(word_X.shape[0], dtype=float)
+
+    # Add word-level signal for keyword-focused queries
+    q_word = word_vec.transform([query])
+    q_word = normalize(q_word)
+    word_scores = word_X @ q_word.T
+    word_scores = np.asarray(word_scores.todense()).ravel()
+
+    # Blend signals
+    return scores * 0.7 + word_scores * 0.3
 
 
 def make_prompt(query: str, candidates: pd.DataFrame) -> str:
@@ -152,26 +202,44 @@ def make_prompt(query: str, candidates: pd.DataFrame) -> str:
     return prompt
 
 
+def _response_text(response) -> str:
+    if response is None:
+        return ""
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    # Fallback for SDKs that don't populate .text
+    try:
+        parts = response.candidates[0].content.parts
+        return "".join([getattr(p, "text", "") for p in parts])
+    except Exception:
+        return ""
+
+
 def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
     if genai is None:
-        return None
+        return None, "google-generativeai 패키지를 불러오지 못했습니다."
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = make_prompt(query, candidates)
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            temperature=0.2,
-            max_output_tokens=2048,
-        ),
-    )
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=2048,
+            ),
+        )
+    except Exception as e:
+        return None, f"LLM 호출 실패: {e}"
 
-    data = extract_json_array(getattr(response, "text", ""))
+    raw = _response_text(response)
+    data = extract_json_array(raw)
     if not data:
-        return None
-    return data
+        return None, "LLM 응답에서 JSON 배열을 파싱하지 못했습니다."
+    return data, ""
 
 
 def normalize_scores_to_100(scores: np.ndarray):
@@ -221,7 +289,7 @@ st.success(f"데이터 로드 완료: {len(df):,} rows")
 with st.expander("데이터 미리보기", expanded=False):
     st.dataframe(df.head(20), use_container_width=True)
 
-vectorizers, matrices = build_index(file_hash, df)
+vectorizers, matrices, word_vec, word_X = build_index(file_hash, df)
 
 st.subheader("2) 입력 과제")
 tab_text, tab_excel = st.tabs(["텍스트 입력", "엑셀 업로드"])
@@ -285,7 +353,8 @@ if run:
 
     for input_id, query in enumerate(inputs, start=1):
         st.write(f"처리 중: 입력 {input_id}")
-        scores = compute_weighted_scores(query, vectorizers, matrices, weights)
+        query_norm = preprocess_query(query)
+        scores = compute_weighted_scores(query_norm, vectorizers, matrices, word_vec, word_X, weights)
         if scores.size == 0:
             continue
 
@@ -300,7 +369,9 @@ if run:
         # rerank
         m = min(rerank_m, len(cand))
         rerank_candidates = cand.head(m).copy()
-        llm_data = rerank_with_llm(query, rerank_candidates, api_key)
+        llm_data, llm_err = rerank_with_llm(query_norm, rerank_candidates, api_key)
+        if llm_err:
+            st.warning(llm_err)
 
         if llm_data:
             llm_df = pd.DataFrame(llm_data)

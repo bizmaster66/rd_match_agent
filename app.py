@@ -363,6 +363,63 @@ def keyword_bonus_scores(df: pd.DataFrame, keywords: list, synonyms: dict, per_k
         bonuses[mask.values] += per_keyword_bonus
 
     return bonuses
+
+
+def build_keyword_groups(keywords: list, synonyms: dict):
+    groups = []
+    for k in keywords:
+        terms = [k] + synonyms.get(k, [])
+        terms = [t for t in terms if t]
+        if terms:
+            groups.append((k, terms))
+    return groups
+
+
+def compute_keyword_matches(df: pd.DataFrame, groups: list):
+    if not groups:
+        return np.zeros(len(df), dtype=int), [[] for _ in range(len(df))]
+
+    combined = (
+        df["대표과제명"].fillna("")
+        + " "
+        + df["연구목표요약"].fillna("")
+        + " "
+        + df["연구개발내용"].fillna("")
+        + " "
+        + df["기대효과요약"].fillna("")
+    ).astype(str)
+
+    match_count = np.zeros(len(df), dtype=int)
+    matched = [[] for _ in range(len(df))]
+    for keyword, terms in groups:
+        pattern = "|".join([re.escape(t) for t in terms if t])
+        if not pattern:
+            continue
+        mask = combined.str.contains(pattern, case=False, regex=True)
+        idxs = np.where(mask.values)[0]
+        match_count[idxs] += 1
+        for i in idxs:
+            matched[i].append(keyword)
+
+    return match_count, matched
+
+
+def find_snippet(row: pd.Series, terms: list, window: int = 30) -> str:
+    fields = ["연구개발내용", "대표과제명", "연구목표요약", "기대효과요약"]
+    for col in fields:
+        text = safe_text(row.get(col, ""))
+        if not text:
+            continue
+        for term in terms:
+            if not term:
+                continue
+            m = re.search(re.escape(term), text, flags=re.IGNORECASE)
+            if m:
+                start = max(m.start() - window, 0)
+                end = min(m.end() + window, len(text))
+                snippet = text[start:end]
+                return f"{col}: {snippet}"
+    return ""
 def _response_text(response) -> str:
     if response is None:
         return ""
@@ -564,12 +621,28 @@ if run:
         bonuses = keyword_bonus_scores(df, keywords, synonyms, per_keyword_bonus=keyword_bonus)
         scores = scores + bonuses
 
+        # keyword match filter (prefer >=2, fallback to >=1)
+        groups = build_keyword_groups(keywords, synonyms)
+        match_count, matched_keywords = compute_keyword_matches(df, groups)
+        preferred_mask = match_count >= 2
+        if preferred_mask.sum() == 0:
+            preferred_mask = match_count >= 1
+        if preferred_mask.sum() == 0:
+            preferred_mask = np.ones(len(df), dtype=bool)
+
         # candidate selection
-        k = min(candidate_k, len(df))
-        idxs = np.argpartition(-scores, k - 1)[:k]
+        candidate_pool = np.where(preferred_mask)[0]
+        if len(candidate_pool) == 0:
+            candidate_pool = np.arange(len(df))
+        k = min(candidate_k, len(candidate_pool))
+        pool_scores = scores[candidate_pool]
+        top_local = np.argpartition(-pool_scores, k - 1)[:k]
+        idxs = candidate_pool[top_local]
         cand = df.iloc[idxs].copy()
         cand["_idx"] = idxs
         cand["_tfidf_score"] = scores[idxs]
+        cand["_kw_count"] = match_count[idxs]
+        cand["_kw_list"] = [matched_keywords[i] for i in idxs]
         cand = cand.sort_values("_tfidf_score", ascending=False)
 
         # rerank
@@ -631,6 +704,23 @@ if run:
             axis=1,
         )
 
+        # keyword match info + snippet
+        def keyword_terms_for_row(row):
+            terms = []
+            for kw in row.get("_kw_list", []):
+                terms.append(kw)
+                for s in synonyms.get(kw, []):
+                    terms.append(s)
+            return [t for t in terms if t]
+
+        merged["keyword_match_count"] = merged["_kw_count"].fillna(0).astype(int)
+        merged["matched_keywords"] = merged["_kw_list"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+        threshold = 2 if (match_count >= 2).sum() > 0 else 1
+        merged["keyword_match_passed"] = merged["keyword_match_count"] >= threshold
+        merged["keyword_match_snippet"] = merged.apply(
+            lambda r: find_snippet(r, keyword_terms_for_row(r)), axis=1
+        )
+
         # One more pass for missing rationales (smaller batch)
         missing = merged[merged["rationale"].str.strip() == ""]
         if not missing.empty:
@@ -669,6 +759,10 @@ if run:
                     "점수(0-100)": int(round(row["score"])),
                     "근거요약": row["rationale"],
                     "근거필드": row["evidence_fields"],
+                    "키워드매칭개수": int(row.get("keyword_match_count", 0)),
+                    "매칭된키워드": row.get("matched_keywords", ""),
+                    "키워드매칭통과": bool(row.get("keyword_match_passed", False)),
+                    "키워드매칭스니펫": row.get("keyword_match_snippet", ""),
                 }
             )
 

@@ -207,6 +207,7 @@ def build_index(file_hash: str, df: pd.DataFrame):
 
 def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X, weights):
     scores = None
+    per_field = {}
     for col, weight in weights.items():
         vec = vectorizers[col]
         X = matrices[col]
@@ -214,6 +215,7 @@ def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X,
         q = normalize(q)
         col_scores = X @ q.T
         col_scores = np.asarray(col_scores.todense()).ravel()
+        per_field[col] = col_scores
         if scores is None:
             scores = weight * col_scores
         else:
@@ -229,10 +231,11 @@ def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X,
     word_scores = np.asarray(word_scores.todense()).ravel()
 
     # Blend signals
-    return scores * 0.7 + word_scores * 0.3
+    blended = scores * 0.7 + word_scores * 0.3
+    return blended, per_field
 
 
-def make_prompt(query: str, candidates: pd.DataFrame, strict: bool = False) -> str:
+def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool = False) -> str:
     items = []
     for _, row in candidates.iterrows():
         items.append(
@@ -253,6 +256,7 @@ def make_prompt(query: str, candidates: pd.DataFrame, strict: bool = False) -> s
         "후보 목록(JSON):\n"
         f"{json.dumps(items, ensure_ascii=False)}\n\n"
         "각 후보에 대해 입력 과제와의 관련성을 평가해라.\n"
+        f"출력은 상위 {top_n}개 결과만 포함한다. (부족하면 가능한 만큼만)\n"
         "출력은 반드시 JSON 배열만 반환한다.\n"
         "형식: [{\"idx\":123, \"score\":87, \"rationale\":\"...\", \"evidence_fields\":[\"연구개발내용\", \"대표과제명\"]}]\n"
         "조건:\n"
@@ -282,7 +286,7 @@ def _response_text(response) -> str:
         return ""
 
 
-def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
+def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str, top_n: int):
     if genai is None:
         return None, "google-generativeai 패키지를 불러오지 못했습니다.", None
 
@@ -295,7 +299,7 @@ def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
                 prompt_text,
                 generation_config=genai.GenerationConfig(
                     temperature=0.2,
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                     response_mime_type="application/json",
                 ),
             )
@@ -305,11 +309,11 @@ def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
                 prompt_text,
                 generation_config=genai.GenerationConfig(
                     temperature=0.2,
-                    max_output_tokens=2048,
+                    max_output_tokens=4096,
                 ),
             )
 
-    prompt = make_prompt(query, candidates, strict=False)
+    prompt = make_prompt(query, candidates, top_n=top_n, strict=False)
     try:
         response = _call(prompt)
     except Exception as e:
@@ -322,7 +326,7 @@ def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
 
     # Retry with stricter prompt
     try:
-        response2 = _call(make_prompt(query, candidates, strict=True))
+        response2 = _call(make_prompt(query, candidates, top_n=top_n, strict=True))
     except Exception as e:
         return None, f"LLM 호출 실패: {e}", None
 
@@ -445,7 +449,9 @@ if run:
     for input_id, query in enumerate(inputs, start=1):
         st.write(f"처리 중: 입력 {input_id}")
         query_norm = preprocess_query(query)
-        scores = compute_weighted_scores(query_norm, vectorizers, matrices, word_vec, word_X, weights)
+        scores, per_field_scores = compute_weighted_scores(
+            query_norm, vectorizers, matrices, word_vec, word_X, weights
+        )
         if scores.size == 0:
             continue
 
@@ -458,9 +464,12 @@ if run:
         cand = cand.sort_values("_tfidf_score", ascending=False)
 
         # rerank
-        m = min(rerank_m, len(cand))
+        max_m = max(top_n * 3, top_n + 10)
+        if rerank_m > max_m:
+            st.info(f"LLM 재랭킹 후보 수를 {max_m}개로 제한했습니다(출력 안정성).")
+        m = min(rerank_m, len(cand), max_m)
         rerank_candidates = cand.head(m).copy()
-        llm_data, llm_err, llm_raw = rerank_with_llm(query_norm, rerank_candidates, api_key)
+        llm_data, llm_err, llm_raw = rerank_with_llm(query_norm, rerank_candidates, api_key, top_n=top_n)
         if llm_err:
             st.warning(llm_err)
             if llm_raw:
@@ -485,8 +494,26 @@ if run:
         # fill missing
         merged["score"] = merged["score"].fillna(0).astype(float)
         merged["rationale"] = merged["rationale"].fillna("")
-        merged["evidence_fields"] = merged["evidence_fields"].apply(
-            lambda v: ", ".join(v) if isinstance(v, list) else safe_text(v)
+        def fallback_fields(idx: int):
+            # choose top 2 fields by per-field similarity
+            items = []
+            for col in ["연구개발내용", "대표과제명", "연구목표요약", "기대효과요약"]:
+                score = per_field_scores.get(col, np.array([]))
+                if score.size:
+                    items.append((col, float(score[idx])))
+            items.sort(key=lambda x: x[1], reverse=True)
+            return [c for c, _ in items[:2]]
+
+        def normalize_fields(val, idx):
+            if isinstance(val, list) and val:
+                return ", ".join(val)
+            if safe_text(val):
+                return safe_text(val)
+            return ", ".join(fallback_fields(idx))
+
+        merged["evidence_fields"] = merged.apply(
+            lambda r: normalize_fields(r.get("evidence_fields", ""), int(r["_idx"])),
+            axis=1,
         )
 
         merged = merged.sort_values("score", ascending=False).head(top_n)

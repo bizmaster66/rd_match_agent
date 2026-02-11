@@ -56,7 +56,32 @@ def truncate(text: str, max_chars: int) -> str:
 def extract_json_array(text: str):
     if not text:
         return None
-    # Try to find a JSON array in the response
+    # Fast path: try full text
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    # Try to find a JSON array substring with bracket matching
+    start = text.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "[":
+            depth += 1
+        elif text[i] == "]":
+            depth -= 1
+            if depth == 0:
+                snippet = text[start : i + 1]
+                try:
+                    return json.loads(snippet)
+                except Exception:
+                    break
+
+    # Regex fallback (last resort)
     match = re.search(r"\[.*\]", text, flags=re.S)
     if not match:
         return None
@@ -171,7 +196,7 @@ def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X,
     return scores * 0.7 + word_scores * 0.3
 
 
-def make_prompt(query: str, candidates: pd.DataFrame) -> str:
+def make_prompt(query: str, candidates: pd.DataFrame, strict: bool = False) -> str:
     items = []
     for _, row in candidates.iterrows():
         items.append(
@@ -199,6 +224,11 @@ def make_prompt(query: str, candidates: pd.DataFrame) -> str:
         "- rationale은 한국어 1~2문장\n"
         "- evidence_fields는 다음 중에서만 선택: 대표과제명, 연구목표요약, 연구개발내용, 기대효과요약\n"
     )
+    if strict:
+        prompt += (
+            "\n중요: JSON 외에 다른 텍스트를 출력하지 마라. "
+            "코드블록(```)이나 설명을 추가하지 마라.\n"
+        )
     return prompt
 
 
@@ -218,28 +248,53 @@ def _response_text(response) -> str:
 
 def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str):
     if genai is None:
-        return None, "google-generativeai 패키지를 불러오지 못했습니다."
+        return None, "google-generativeai 패키지를 불러오지 못했습니다.", None
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
-    prompt = make_prompt(query, candidates)
+    def _call(prompt_text):
+        try:
+            return model.generate_content(
+                prompt_text,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=2048,
+                    response_mime_type="application/json",
+                ),
+            )
+        except TypeError:
+            # Older SDKs may not support response_mime_type
+            return model.generate_content(
+                prompt_text,
+                generation_config=genai.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=2048,
+                ),
+            )
+
+    prompt = make_prompt(query, candidates, strict=False)
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=2048,
-            ),
-        )
+        response = _call(prompt)
     except Exception as e:
-        return None, f"LLM 호출 실패: {e}"
+        return None, f"LLM 호출 실패: {e}", None
 
     raw = _response_text(response)
     data = extract_json_array(raw)
-    if not data:
-        return None, "LLM 응답에서 JSON 배열을 파싱하지 못했습니다."
-    return data, ""
+    if data:
+        return data, "", None
+
+    # Retry with stricter prompt
+    try:
+        response2 = _call(make_prompt(query, candidates, strict=True))
+    except Exception as e:
+        return None, f"LLM 호출 실패: {e}", None
+
+    raw2 = _response_text(response2)
+    data2 = extract_json_array(raw2)
+    if not data2:
+        return None, "LLM 응답에서 JSON 배열을 파싱하지 못했습니다.", raw2
+    return data2, "", None
 
 
 def normalize_scores_to_100(scores: np.ndarray):
@@ -369,9 +424,12 @@ if run:
         # rerank
         m = min(rerank_m, len(cand))
         rerank_candidates = cand.head(m).copy()
-        llm_data, llm_err = rerank_with_llm(query_norm, rerank_candidates, api_key)
+        llm_data, llm_err, llm_raw = rerank_with_llm(query_norm, rerank_candidates, api_key)
         if llm_err:
             st.warning(llm_err)
+            if llm_raw:
+                with st.expander("LLM 원본 응답(디버그)", expanded=False):
+                    st.code(llm_raw)
 
         if llm_data:
             llm_df = pd.DataFrame(llm_data)

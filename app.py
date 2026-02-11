@@ -56,11 +56,19 @@ def truncate(text: str, max_chars: int) -> str:
 def extract_json_array(text: str):
     if not text:
         return None
+    text = text.strip()
+    # Strip code fences if present
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9]*", "", text).strip()
+        if text.endswith("```"):
+            text = text[:-3].strip()
     # Fast path: try full text
     try:
         data = json.loads(text)
         if isinstance(data, list):
             return data
+        if isinstance(data, dict):
+            return [data]
     except Exception:
         pass
 
@@ -80,6 +88,34 @@ def extract_json_array(text: str):
                     return json.loads(snippet)
                 except Exception:
                     break
+
+    # Try to extract one or more JSON objects
+    objects = []
+    start = 0
+    while True:
+        s = text.find("{", start)
+        if s == -1:
+            break
+        depth = 0
+        for i in range(s, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    snippet = text[s : i + 1]
+                    try:
+                        obj = json.loads(snippet)
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except Exception:
+                        pass
+                    start = i + 1
+                    break
+        else:
+            break
+    if objects:
+        return objects
 
     # Regex fallback (last resort)
     match = re.search(r"\[.*\]", text, flags=re.S)

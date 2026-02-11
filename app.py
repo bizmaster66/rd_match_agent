@@ -85,7 +85,7 @@ def preprocess_query(query: str) -> str:
     # If user provided comma-separated keywords, append a compact token string
     tokens = tokenize_simple(q)
     if tokens:
-        q = f\"{q} \" + \" \".join(tokens)
+        q = f"{q} " + " ".join(tokens)
     return q
 
 

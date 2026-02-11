@@ -41,6 +41,8 @@ REQUIRED_COLUMNS = [
 # -----------------------------
 
 def safe_text(val: object) -> str:
+    if isinstance(val, (list, tuple, dict)):
+        return ""
     if pd.isna(val):
         return ""
     return str(val).strip()

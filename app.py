@@ -286,7 +286,7 @@ def _response_text(response) -> str:
         return ""
 
 
-def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str, top_n: int):
+def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str, top_n: int, batch_size: int):
     if genai is None:
         return None, "google-generativeai 패키지를 불러오지 못했습니다.", None
 
@@ -313,28 +313,37 @@ def rerank_with_llm(query: str, candidates: pd.DataFrame, api_key: str, top_n: i
                 ),
             )
 
-    prompt = make_prompt(query, candidates, top_n=top_n, strict=False)
-    try:
-        response = _call(prompt)
-    except Exception as e:
-        return None, f"LLM 호출 실패: {e}", None
+    all_items = []
+    raw_debug = []
+    for start in range(0, len(candidates), batch_size):
+        chunk = candidates.iloc[start : start + batch_size]
+        chunk_top = min(top_n, len(chunk))
+        prompt = make_prompt(query, chunk, top_n=chunk_top, strict=False)
+        try:
+            response = _call(prompt)
+        except Exception as e:
+            return None, f"LLM 호출 실패: {e}", None
 
-    raw = _response_text(response)
-    data = extract_json_array(raw)
-    if data:
-        return data, "", None
+        raw = _response_text(response)
+        data = extract_json_array(raw)
+        if not data:
+            # Retry with stricter prompt
+            try:
+                response2 = _call(make_prompt(query, chunk, top_n=chunk_top, strict=True))
+            except Exception as e:
+                return None, f"LLM 호출 실패: {e}", None
+            raw2 = _response_text(response2)
+            data = extract_json_array(raw2)
+            if not data:
+                raw_debug.append(raw2)
+                continue
 
-    # Retry with stricter prompt
-    try:
-        response2 = _call(make_prompt(query, candidates, top_n=top_n, strict=True))
-    except Exception as e:
-        return None, f"LLM 호출 실패: {e}", None
+        all_items.extend(data)
+        raw_debug.append(raw)
 
-    raw2 = _response_text(response2)
-    data2 = extract_json_array(raw2)
-    if not data2:
-        return None, "LLM 응답에서 JSON 배열을 파싱하지 못했습니다.", raw2
-    return data2, "", None
+    if not all_items:
+        return None, "LLM 응답에서 JSON 배열을 파싱하지 못했습니다.", "\n\n".join(raw_debug)
+    return all_items, "", "\n\n".join(raw_debug)
 
 
 def normalize_scores_to_100(scores: np.ndarray):
@@ -428,6 +437,7 @@ with col2:
 with st.expander("고급 설정", expanded=False):
     candidate_k = st.slider("1차 후보 수(K)", min_value=50, max_value=500, value=200, step=10)
     rerank_m = st.slider("LLM 재랭킹 개수", min_value=20, max_value=100, value=40, step=5)
+    rerank_batch = st.slider("LLM 배치 크기", min_value=5, max_value=20, value=10, step=1)
     st.markdown("필드 가중치")
     w_title = st.number_input("대표과제명", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
     w_goal = st.number_input("연구목표요약", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
@@ -469,9 +479,15 @@ if run:
             st.info(f"LLM 재랭킹 후보 수를 {max_m}개로 제한했습니다(출력 안정성).")
         m = min(rerank_m, len(cand), max_m)
         rerank_candidates = cand.head(m).copy()
-        llm_data, llm_err, llm_raw = rerank_with_llm(query_norm, rerank_candidates, api_key, top_n=top_n)
+        llm_data, llm_err, llm_raw = rerank_with_llm(
+            query_norm, rerank_candidates, api_key, top_n=top_n, batch_size=rerank_batch
+        )
         if llm_err:
             st.warning(llm_err)
+            if llm_raw:
+                with st.expander("LLM 원본 응답(디버그)", expanded=False):
+                    st.code(llm_raw)
+        else:
             if llm_raw:
                 with st.expander("LLM 원본 응답(디버그)", expanded=False):
                     st.code(llm_raw)
@@ -515,6 +531,31 @@ if run:
             lambda r: normalize_fields(r.get("evidence_fields", ""), int(r["_idx"])),
             axis=1,
         )
+
+        # One more pass for missing rationales (smaller batch)
+        missing = merged[merged["rationale"].str.strip() == ""]
+        if not missing.empty:
+            st.info(f"근거요약이 비어 있는 {len(missing)}개 항목을 추가 생성합니다.")
+            llm_data2, llm_err2, _ = rerank_with_llm(
+                query_norm, missing, api_key, top_n=len(missing), batch_size=min(5, rerank_batch)
+            )
+            if llm_data2:
+                llm_df2 = pd.DataFrame(llm_data2)
+                if "idx" in llm_df2.columns:
+                    merged = merged.merge(llm_df2, left_on="_idx", right_on="idx", how="left", suffixes=("", "_new"))
+                    merged["rationale"] = merged["rationale"].where(
+                        merged["rationale"].str.strip() != "",
+                        merged["rationale_new"].fillna(""),
+                    )
+                    merged["score"] = merged["score"].where(
+                        merged["score"] > 0,
+                        merged["score_new"].fillna(0),
+                    )
+                    merged["evidence_fields"] = merged["evidence_fields"].where(
+                        merged["evidence_fields"].str.strip() != "",
+                        merged["evidence_fields_new"].fillna(""),
+                    )
+                    merged = merged.drop(columns=[c for c in merged.columns if c.endswith("_new")], errors="ignore")
 
         merged = merged.sort_values("score", ascending=False).head(top_n)
 

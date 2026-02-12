@@ -11,6 +11,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
+from rank_bm25 import BM25Okapi
 
 try:
     import google.generativeai as genai
@@ -204,7 +205,11 @@ def build_index(file_hash: str, df: pd.DataFrame):
     word_X = word_vec.fit_transform(combined)
     word_X = normalize(word_X)
 
-    return vectorizers, matrices, word_vec, word_X
+    # BM25 index
+    tokenized = [tokenize_simple(t) for t in combined]
+    bm25 = BM25Okapi(tokenized)
+
+    return vectorizers, matrices, word_vec, word_X, bm25, tokenized
 
 
 def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X, weights):
@@ -237,6 +242,67 @@ def compute_weighted_scores(query: str, vectorizers, matrices, word_vec, word_X,
     return blended, per_field
 
 
+def normalize_0_100(arr: np.ndarray):
+    if arr.size == 0:
+        return arr
+    min_v = float(arr.min())
+    max_v = float(arr.max())
+    if max_v - min_v < 1e-9:
+        return np.full_like(arr, 50.0)
+    return (arr - min_v) / (max_v - min_v) * 100.0
+
+
+def _extract_embedding(response):
+    if response is None:
+        return None
+    if isinstance(response, dict):
+        if "embedding" in response:
+            return response["embedding"]
+        if "embeddings" in response:
+            return response["embeddings"]
+    if hasattr(response, "embedding"):
+        return response.embedding
+    if hasattr(response, "embeddings"):
+        return response.embeddings
+    return None
+
+
+def embed_texts(texts: list, api_key: str):
+    if genai is None:
+        return None
+    genai.configure(api_key=api_key)
+    model = "gemini-embedding-001"
+    # Try batch embedding
+    try:
+        resp = genai.embed_content(
+            model=model,
+            content=texts,
+        )
+        emb = _extract_embedding(resp)
+        if isinstance(emb, list) and emb and isinstance(emb[0], (list, np.ndarray)):
+            return np.array(emb, dtype=float)
+        if isinstance(emb, list) and emb and isinstance(emb[0], dict) and "values" in emb[0]:
+            return np.array([e["values"] for e in emb], dtype=float)
+    except Exception:
+        pass
+
+    # Fallback: single call per text
+    vectors = []
+    for t in texts:
+        try:
+            resp = genai.embed_content(model=model, content=t)
+            emb = _extract_embedding(resp)
+            if isinstance(emb, dict) and "values" in emb:
+                vectors.append(emb["values"])
+            else:
+                vectors.append(emb)
+        except Exception:
+            vectors.append(None)
+    if any(v is None for v in vectors):
+        return None
+    return np.array(vectors, dtype=float)
+
+
 def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool = False) -> str:
     items = []
     for _, row in candidates.iterrows():
@@ -260,8 +326,9 @@ def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool =
         "각 후보에 대해 입력 과제와의 관련성을 평가해라.\n"
         f"출력은 상위 {top_n}개 결과만 포함한다. (부족하면 가능한 만큼만)\n"
         "출력은 반드시 JSON 배열만 반환한다.\n"
-        "형식: [{\"idx\":123, \"score\":87, \"rationale\":\"...\", \"evidence_fields\":[\"연구개발내용\", \"대표과제명\"]}]\n"
+        "형식: [{\"idx\":123, \"is_relevant\":true, \"score\":87, \"rationale\":\"...\", \"evidence_fields\":[\"연구개발내용\", \"대표과제명\"]}]\n"
         "조건:\n"
+        "- is_relevant는 입력 과제와 관련 있으면 true, 아니면 false\n"
         "- score는 0~100 정수\n"
         "- rationale은 한국어 1문장(60자 이내)\n"
         "- evidence_fields는 다음 중에서만 선택: 대표과제명, 연구목표요약, 연구개발내용, 기대효과요약\n"
@@ -326,6 +393,54 @@ def extract_keywords_with_llm(query: str, api_key: str):
         return keywords[:3], syn_norm
     except Exception:
         return [], {}
+
+
+def make_rewrite_prompt(query: str, keywords: list, synonyms: dict) -> str:
+    kw = ", ".join(keywords) if keywords else ""
+    prompt = (
+        "너는 검색 쿼리를 재작성하는 역할이다.\n"
+        f"입력 과제: \"{query}\"\n"
+        f"핵심 키워드: {kw}\n"
+        "키워드의 동의어/유의어를 고려해 검색용 쿼리를 확장해라.\n"
+        "다음 JSON 형식으로만 출력하라.\n"
+        "{\"rewrite\": \"...\"}\n"
+        "조건:\n"
+        "- 한국어 중심\n"
+        "- 1문장 또는 키워드 나열 형태\n"
+        "- 원문 의미를 왜곡하지 말 것\n"
+    )
+    return prompt
+
+
+def rewrite_query_with_llm(query: str, keywords: list, synonyms: dict, api_key: str):
+    if genai is None:
+        return query
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    try:
+        response = model.generate_content(
+            make_rewrite_prompt(query, keywords, synonyms),
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=256,
+                response_mime_type="application/json",
+            ),
+        )
+    except TypeError:
+        response = model.generate_content(
+            make_rewrite_prompt(query, keywords, synonyms),
+            generation_config=genai.GenerationConfig(
+                temperature=0.2,
+                max_output_tokens=256,
+            ),
+        )
+    raw = _response_text(response)
+    try:
+        data = json.loads(raw)
+        rewrite = safe_text(data.get("rewrite", ""))
+        return rewrite if rewrite else query
+    except Exception:
+        return query
 
 
 def keyword_bonus_scores(df: pd.DataFrame, keywords: list, synonyms: dict, per_keyword_bonus: float):
@@ -541,7 +656,7 @@ st.success(f"데이터 로드 완료: {len(df):,} rows")
 with st.expander("데이터 미리보기", expanded=False):
     st.dataframe(df.head(20), use_container_width=True)
 
-vectorizers, matrices, word_vec, word_X = build_index(file_hash, df)
+vectorizers, matrices, word_vec, word_X, bm25, tokenized = build_index(file_hash, df)
 
 st.subheader("2) 입력 과제")
 tab_text, tab_excel = st.tabs(["텍스트 입력", "엑셀 업로드"])
@@ -611,8 +726,9 @@ if run:
         keywords, synonyms = extract_keywords_with_llm(query_norm, api_key)
         if keywords:
             st.caption(f"핵심 키워드: {', '.join(keywords)}")
+        query_rewrite = rewrite_query_with_llm(query_norm, keywords, synonyms, api_key)
         scores, per_field_scores = compute_weighted_scores(
-            query_norm, vectorizers, matrices, word_vec, word_X, weights
+            query_rewrite, vectorizers, matrices, word_vec, word_X, weights
         )
         if scores.size == 0:
             continue
@@ -620,6 +736,10 @@ if run:
         # keyword bonus (hard signal)
         bonuses = keyword_bonus_scores(df, keywords, synonyms, per_keyword_bonus=keyword_bonus)
         scores = scores + bonuses
+
+        # BM25 score
+        bm25_scores = bm25.get_scores(tokenize_simple(query_rewrite))
+        bm25_scores = normalize_0_100(np.asarray(bm25_scores, dtype=float))
 
         # keyword match filter (prefer >=2, fallback to >=1)
         groups = build_keyword_groups(keywords, synonyms)
@@ -629,28 +749,66 @@ if run:
             preferred_mask = match_count >= 1
         if preferred_mask.sum() == 0:
             preferred_mask = np.ones(len(df), dtype=bool)
+        threshold = 2 if (match_count >= 2).sum() > 0 else 1
+        if (match_count >= threshold).sum() > top_n:
+            st.warning("키워드 매칭 과제가 상위 결과 개수보다 많습니다. 일부만 표시됩니다.")
 
         # candidate selection
         candidate_pool = np.where(preferred_mask)[0]
         if len(candidate_pool) == 0:
             candidate_pool = np.arange(len(df))
         k = min(candidate_k, len(candidate_pool))
-        pool_scores = scores[candidate_pool]
+        # combine tfidf + bm25 + keyword bonus for pool scoring
+        tfidf_norm = normalize_0_100(scores)
+        pool_scores = tfidf_norm[candidate_pool] * 0.6 + bm25_scores[candidate_pool] * 0.4
         top_local = np.argpartition(-pool_scores, k - 1)[:k]
         idxs = candidate_pool[top_local]
         cand = df.iloc[idxs].copy()
         cand["_idx"] = idxs
         cand["_tfidf_score"] = scores[idxs]
+        cand["_bm25_score"] = bm25_scores[idxs]
         cand["_kw_count"] = match_count[idxs]
         cand["_kw_list"] = [matched_keywords[i] for i in idxs]
         cand = cand.sort_values("_tfidf_score", ascending=False)
+
+        # dense embedding rerank signal (on candidate set)
+        max_embed = 1200
+        embed_subset = cand
+        if len(embed_subset) > max_embed:
+            embed_subset = cand.head(max_embed).copy()
+        embed_texts_list = (
+            embed_subset["대표과제명"].fillna("")
+            + " "
+            + embed_subset["연구목표요약"].fillna("")
+            + " "
+            + embed_subset["연구개발내용"].fillna("")
+            + " "
+            + embed_subset["기대효과요약"].fillna("")
+        ).astype(str).tolist()
+        q_vec = embed_texts([query_rewrite], api_key)
+        d_vecs = embed_texts(embed_texts_list, api_key) if q_vec is not None else None
+        if q_vec is not None and d_vecs is not None:
+            qn = q_vec / (np.linalg.norm(q_vec, axis=1, keepdims=True) + 1e-9)
+            dn = d_vecs / (np.linalg.norm(d_vecs, axis=1, keepdims=True) + 1e-9)
+            sim = np.dot(dn, qn.T).ravel()
+            embed_scores = normalize_0_100(sim)
+            embed_map = dict(zip(embed_subset["_idx"].tolist(), embed_scores.tolist()))
+            cand["_embed_score"] = cand["_idx"].apply(lambda i: embed_map.get(i, 0.0))
+        else:
+            cand["_embed_score"] = 0.0
 
         # rerank
         max_m = max(top_n * 2, top_n + 10)
         if rerank_m > max_m:
             st.info(f"LLM 재랭킹 후보 수를 {max_m}개로 제한했습니다(출력 안정성).")
         m = min(rerank_m, len(cand), max_m)
-        rerank_candidates = cand.head(m).copy()
+        # combine signals for rerank selection
+        cand["_final_score"] = (
+            normalize_0_100(cand["_tfidf_score"].values) * 0.4
+            + normalize_0_100(cand["_bm25_score"].values) * 0.3
+            + normalize_0_100(cand["_embed_score"].values) * 0.3
+        )
+        rerank_candidates = cand.sort_values("_final_score", ascending=False).head(m).copy()
         llm_data, llm_err, llm_raw = rerank_with_llm(
             query_norm, rerank_candidates, api_key, top_n=top_n, batch_size=rerank_batch
         )
@@ -670,18 +828,29 @@ if run:
                 merged = rerank_candidates.merge(llm_df, left_on="_idx", right_on="idx", how="left")
             else:
                 merged = rerank_candidates.copy()
-                merged["score"] = normalize_scores_to_100(merged["_tfidf_score"].values)
+                merged["score"] = normalize_scores_to_100(merged["_final_score"].values)
                 merged["rationale"] = ""
                 merged["evidence_fields"] = ""
         else:
             merged = rerank_candidates.copy()
-            merged["score"] = normalize_scores_to_100(merged["_tfidf_score"].values)
+            merged["score"] = normalize_scores_to_100(merged["_final_score"].values)
             merged["rationale"] = ""
             merged["evidence_fields"] = ""
 
         # fill missing
         merged["score"] = merged["score"].fillna(0).astype(float)
         merged["rationale"] = merged["rationale"].fillna("")
+        if "is_relevant" in merged.columns:
+            merged["is_relevant"] = merged["is_relevant"].apply(
+                lambda v: True if str(v).lower() in ["true", "1", "yes"] else False if str(v).lower() in ["false", "0", "no"] else bool(v)
+            )
+        else:
+            merged["is_relevant"] = True
+        # If LLM provided relevance, filter to relevant only when available
+        if "is_relevant" in merged.columns and merged["is_relevant"].notna().any():
+            rel = merged["is_relevant"] == True
+            if rel.sum() > 0:
+                merged = merged[rel]
         def fallback_fields(idx: int):
             # choose top 2 fields by per-field similarity
             items = []
@@ -715,7 +884,6 @@ if run:
 
         merged["keyword_match_count"] = merged["_kw_count"].fillna(0).astype(int)
         merged["matched_keywords"] = merged["_kw_list"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
-        threshold = 2 if (match_count >= 2).sum() > 0 else 1
         merged["keyword_match_passed"] = merged["keyword_match_count"] >= threshold
         merged["keyword_match_snippet"] = merged.apply(
             lambda r: find_snippet(r, keyword_terms_for_row(r)), axis=1
@@ -753,6 +921,8 @@ if run:
                 {
                     "input_id": input_id,
                     "input_text": query,
+                    "추출키워드": ", ".join(keywords) if keywords else "",
+                    "검색쿼리": query_rewrite,
                     "기업명": row["기업명"],
                     "R&D과제번호": row["R&D과제번호"],
                     "대표과제명": row["대표과제명"],

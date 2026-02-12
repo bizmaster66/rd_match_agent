@@ -5,3 +5,4 @@ scipy
 openpyxl
 python-dotenv
 google-generativeai
+rank-bm25

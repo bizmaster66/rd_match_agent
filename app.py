@@ -137,6 +137,29 @@ def tokenize_simple(text: str):
     return re.findall(r"[A-Za-z0-9]+|[가-힣]+", text)
 
 
+def expand_variants(term: str):
+    t = safe_text(term)
+    if not t:
+        return []
+    variants = {t}
+    pairs = [
+        ("컴퓨팅", "컴퓨터"),
+        ("분석", "분석기"),
+        ("진단", "진단기"),
+        ("최적화", "최적"),
+        ("예측", "예측기"),
+        ("추천", "추천기"),
+        ("인공지능", "AI"),
+        ("빅데이터", "빅 데이터"),
+    ]
+    for a, b in pairs:
+        if a in t:
+            variants.add(t.replace(a, b))
+        if b in t:
+            variants.add(t.replace(b, a))
+    return list(variants)
+
+
 def preprocess_query(query: str) -> str:
     q = safe_text(query)
     if not q:
@@ -352,6 +375,8 @@ def make_keyword_prompt(query: str) -> str:
         "- keywords는 1~3개\n"
         "- 한국어 중심, 의미상 핵심 단어만\n"
         "- synonyms는 각 키워드당 0~4개, 너무 일반적인 단어는 제외\n"
+        "- 같은 개념의 표현 변형(예: 컴퓨팅/컴퓨터, 분석/분석기, 진단/진단기, 최적화/최적 등)은 반드시 포함\n"
+        "- 키워드의 한자/영문 약어도 있으면 포함 (예: 인공지능/AI)\n"
     )
     return prompt
 
@@ -390,7 +415,17 @@ def extract_keywords_with_llm(query: str, api_key: str):
                 continue
             if isinstance(vals, list):
                 syn_norm[safe_text(k)] = [safe_text(v) for v in vals if safe_text(v)]
-        return keywords[:3], syn_norm
+        # Expand variants for each keyword and synonym
+        expanded = {}
+        for k in keywords:
+            base = expand_variants(k)
+            syns = syn_norm.get(k, [])
+            all_terms = []
+            for s in syns:
+                all_terms.extend(expand_variants(s))
+            all_terms.extend(base)
+            expanded[k] = list(dict.fromkeys([t for t in all_terms if t]))
+        return keywords[:3], expanded
     except Exception:
         return [], {}
 

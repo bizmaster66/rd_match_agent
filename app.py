@@ -795,6 +795,7 @@ st.caption("입력 과제(문단/키워드)와 관련성이 높은 기업 및 R&
 
 load_dotenv()
 api_key = os.getenv("GOOGLE_API_KEY")
+is_cloud = os.getcwd().startswith("/mount/src")
 
 if not api_key:
     st.error("GOOGLE_API_KEY가 설정되지 않았습니다. .env 또는 Streamlit Secrets에 설정하세요.")
@@ -828,8 +829,13 @@ with tab_excel_src:
 
         with st.expander("인덱스/번들 생성 (로컬용)", expanded=False):
             st.caption("임베딩과 벡터 인덱스를 생성해 번들(zip)로 내려받습니다.")
-            batch_size = st.slider("임베딩 배치 크기", min_value=16, max_value=128, value=64, step=16)
-            build_bundle_btn = st.button("번들 생성", key="build_bundle_btn")
+            if is_cloud:
+                st.warning("Streamlit Cloud에서는 메모리 한도 때문에 번들 생성을 비활성화했습니다. 로컬에서 생성 후 번들을 업로드하세요.")
+                batch_size = st.slider("임베딩 배치 크기", min_value=16, max_value=128, value=64, step=16, disabled=True)
+                build_bundle_btn = st.button("번들 생성", key="build_bundle_btn", disabled=True)
+            else:
+                batch_size = st.slider("임베딩 배치 크기", min_value=16, max_value=128, value=64, step=16)
+                build_bundle_btn = st.button("번들 생성", key="build_bundle_btn")
             if build_bundle_btn:
                 progress = st.progress(0.0)
                 tags, tags_expanded = extract_tags_simple(df, top_k=3)

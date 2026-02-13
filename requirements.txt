@@ -6,3 +6,4 @@ openpyxl
 python-dotenv
 google-generativeai
 rank-bm25
+faiss-cpu

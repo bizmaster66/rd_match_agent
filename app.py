@@ -2,6 +2,8 @@ import os
 import re
 import json
 import hashlib
+import tempfile
+import zipfile
 from io import BytesIO
 from datetime import datetime
 
@@ -12,6 +14,7 @@ from dotenv import load_dotenv
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 from rank_bm25 import BM25Okapi
+import faiss
 
 try:
     import google.generativeai as genai
@@ -191,6 +194,127 @@ def load_rnd_data(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def combined_text_series(df: pd.DataFrame) -> pd.Series:
+    base = (
+        df["대표과제명"].fillna("")
+        + " "
+        + df["연구목표요약"].fillna("")
+        + " "
+        + df["연구개발내용"].fillna("")
+        + " "
+        + df["기대효과요약"].fillna("")
+    ).astype(str)
+    if "tags_expanded" in df.columns:
+        base = base + " " + df["tags_expanded"].fillna("").astype(str)
+    return base
+
+
+def extract_tags_simple(df: pd.DataFrame, top_k: int = 3):
+    texts = combined_text_series(df).tolist()
+    tokenized = [tokenize_simple(t) for t in texts]
+    # Build document frequency
+    df_counts = {}
+    for toks in tokenized:
+        for tok in set([t for t in toks if len(t) >= 2]):
+            df_counts[tok] = df_counts.get(tok, 0) + 1
+    n_docs = len(tokenized)
+
+    tags = []
+    tags_expanded = []
+    for toks in tokenized:
+        tf = {}
+        for t in toks:
+            if len(t) < 2:
+                continue
+            tf[t] = tf.get(t, 0) + 1
+        # simple tf-idf scoring
+        scores = []
+        for t, cnt in tf.items():
+            idf = np.log((n_docs + 1) / (df_counts.get(t, 1) + 1)) + 1.0
+            scores.append((t, cnt * idf))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        top = [t for t, _ in scores[:top_k]]
+        tags.append(", ".join(top))
+
+        expanded = []
+        for t in top:
+            expanded.extend(expand_variants(t))
+        expanded = list(dict.fromkeys([t for t in expanded if t]))
+        tags_expanded.append(", ".join(expanded))
+
+    return tags, tags_expanded
+
+
+def build_faiss_index(embeddings: np.ndarray):
+    if embeddings is None or len(embeddings) == 0:
+        return None
+    emb = embeddings.astype("float32")
+    faiss.normalize_L2(emb)
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(emb)
+    return index
+
+
+def save_bundle(df: pd.DataFrame, embeddings: np.ndarray, index, file_hash: str):
+    manifest = {
+        "rows": len(df),
+        "hash": file_hash,
+        "created_at": datetime.now().isoformat(),
+        "embedding_model": "gemini-embedding-001",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        meta_path = os.path.join(tmp, "meta.csv")
+        emb_path = os.path.join(tmp, "embeddings.npy")
+        idx_path = os.path.join(tmp, "faiss.index")
+        manifest_path = os.path.join(tmp, "manifest.json")
+
+        df.to_csv(meta_path, index=False)
+        np.save(emb_path, embeddings.astype("float32"))
+        if index is not None:
+            faiss.write_index(index, idx_path)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        zip_buf = BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(meta_path, "meta.csv")
+            zf.write(emb_path, "embeddings.npy")
+            if index is not None:
+                zf.write(idx_path, "faiss.index")
+            zf.write(manifest_path, "manifest.json")
+        zip_buf.seek(0)
+        return zip_buf
+
+
+@st.cache_resource(show_spinner=False)
+def load_bundle(bundle_bytes: bytes):
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = os.path.join(tmp, "bundle.zip")
+        with open(zip_path, "wb") as f:
+            f.write(bundle_bytes)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmp)
+
+        meta_path = os.path.join(tmp, "meta.csv")
+        emb_path = os.path.join(tmp, "embeddings.npy")
+        idx_path = os.path.join(tmp, "faiss.index")
+        manifest_path = os.path.join(tmp, "manifest.json")
+
+        df = pd.read_csv(meta_path)
+        embeddings = np.load(emb_path)
+        index = faiss.read_index(idx_path) if os.path.exists(idx_path) else None
+        manifest = {}
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+
+    # restore columns to expected types
+    for col in REQUIRED_COLUMNS:
+        if col in df.columns:
+            df[col] = df[col].apply(safe_text)
+    return df, embeddings, index, manifest
+
+
 @st.cache_resource(show_spinner=False)
 def build_index(file_hash: str, df: pd.DataFrame):
     # Use char n-grams to better capture Korean text similarity per field
@@ -210,15 +334,7 @@ def build_index(file_hash: str, df: pd.DataFrame):
         matrices[col] = X
 
     # Combined word-level index for keyword-heavy queries
-    combined = (
-        df["대표과제명"].fillna("")
-        + " "
-        + df["연구목표요약"].fillna("")
-        + " "
-        + df["연구개발내용"].fillna("")
-        + " "
-        + df["기대효과요약"].fillna("")
-    ).astype(str).tolist()
+    combined = combined_text_series(df).tolist()
 
     word_vec = TfidfVectorizer(
         tokenizer=tokenize_simple,
@@ -324,6 +440,20 @@ def embed_texts(texts: list, api_key: str):
     if any(v is None for v in vectors):
         return None
     return np.array(vectors, dtype=float)
+
+
+def embed_texts_batched(texts: list, api_key: str, batch_size: int = 64, progress=None):
+    vectors = []
+    total = len(texts)
+    for i in range(0, total, batch_size):
+        batch = texts[i : i + batch_size]
+        emb = embed_texts(batch, api_key)
+        if emb is None:
+            return None
+        vectors.append(emb)
+        if progress:
+            progress.progress(min((i + batch_size) / total, 1.0))
+    return np.vstack(vectors) if vectors else None
 
 
 def make_prompt(query: str, candidates: pd.DataFrame, top_n: int, strict: bool = False) -> str:
@@ -670,26 +800,73 @@ if not api_key:
     st.error("GOOGLE_API_KEY가 설정되지 않았습니다. .env 또는 Streamlit Secrets에 설정하세요.")
     st.stop()
 
-st.subheader("1) R&D 데이터 업로드")
-rnd_file = st.file_uploader("R&D 과제 엑셀 파일을 업로드하세요", type=["xlsx"])
+st.subheader("1) 데이터 소스")
+tab_excel_src, tab_bundle_src = st.tabs(["엑셀 업로드", "번들 업로드"])
 
-if not rnd_file:
-    st.info("먼저 R&D 과제 엑셀을 업로드해주세요.")
+df = None
+file_hash = None
+bundle_index = None
+bundle_embeddings = None
+bundle_manifest = None
+
+with tab_excel_src:
+    rnd_file = st.file_uploader("R&D 과제 엑셀 파일을 업로드하세요", type=["xlsx"])
+    if rnd_file:
+        file_bytes = rnd_file.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+
+        try:
+            df = load_rnd_data(file_bytes)
+        except Exception as e:
+            st.error(str(e))
+            st.stop()
+
+        st.success(f"데이터 로드 완료: {len(df):,} rows")
+
+        with st.expander("데이터 미리보기", expanded=False):
+            st.dataframe(df.head(20), use_container_width=True)
+
+        with st.expander("인덱스/번들 생성 (로컬용)", expanded=False):
+            st.caption("임베딩과 벡터 인덱스를 생성해 번들(zip)로 내려받습니다.")
+            batch_size = st.slider("임베딩 배치 크기", min_value=16, max_value=128, value=64, step=16)
+            build_bundle_btn = st.button("번들 생성", key="build_bundle_btn")
+            if build_bundle_btn:
+                progress = st.progress(0.0)
+                tags, tags_expanded = extract_tags_simple(df, top_k=3)
+                df_bundle = df.copy()
+                df_bundle["tags"] = tags
+                df_bundle["tags_expanded"] = tags_expanded
+
+                texts = combined_text_series(df_bundle).tolist()
+                embeddings = embed_texts_batched(texts, api_key, batch_size=batch_size, progress=progress)
+                if embeddings is None:
+                    st.error("임베딩 생성에 실패했습니다.")
+                else:
+                    index = build_faiss_index(embeddings)
+                    bundle_buf = save_bundle(df_bundle, embeddings, index, file_hash)
+                    today = datetime.now().strftime("%Y%m%d")
+                    bundle_name = f"rnd_index_bundle_{today}.zip"
+                    st.download_button(
+                        label=f"번들 다운로드 ({bundle_name})",
+                        data=bundle_buf,
+                        file_name=bundle_name,
+                        mime="application/zip",
+                    )
+                progress.empty()
+
+with tab_bundle_src:
+    bundle_file = st.file_uploader("번들(zip) 파일을 업로드하세요", type=["zip"])
+    if bundle_file:
+        bundle_bytes = bundle_file.getvalue()
+        df, bundle_embeddings, bundle_index, bundle_manifest = load_bundle(bundle_bytes)
+        file_hash = bundle_manifest.get("hash") if bundle_manifest else hashlib.md5(bundle_bytes).hexdigest()
+        st.success(f"번들 로드 완료: {len(df):,} rows")
+        with st.expander("번들 정보", expanded=False):
+            st.json(bundle_manifest or {})
+
+if df is None:
+    st.info("엑셀 또는 번들 파일을 업로드해주세요.")
     st.stop()
-
-file_bytes = rnd_file.getvalue()
-file_hash = hashlib.md5(file_bytes).hexdigest()
-
-try:
-    df = load_rnd_data(file_bytes)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-st.success(f"데이터 로드 완료: {len(df):,} rows")
-
-with st.expander("데이터 미리보기", expanded=False):
-    st.dataframe(df.head(20), use_container_width=True)
 
 vectorizers, matrices, word_vec, word_X, bm25, tokenized = build_index(file_hash, df)
 
@@ -737,6 +914,10 @@ with st.expander("고급 설정", expanded=False):
     rerank_m = st.slider("LLM 재랭킹 개수", min_value=20, max_value=100, value=40, step=5)
     rerank_batch = st.slider("LLM 배치 크기", min_value=3, max_value=15, value=5, step=1)
     keyword_bonus = st.slider("키워드 포함 가산점", min_value=0, max_value=30, value=10, step=1)
+    if bundle_index is not None:
+        faiss_k = st.slider("FAISS 후보 수", min_value=200, max_value=3000, value=1200, step=100)
+    else:
+        faiss_k = None
     st.markdown("필드 가중치")
     w_title = st.number_input("대표과제명", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
     w_goal = st.number_input("연구목표요약", min_value=0.0, max_value=5.0, value=1.0, step=0.5)
@@ -790,6 +971,14 @@ if run:
 
         # candidate selection
         candidate_pool = np.where(preferred_mask)[0]
+        if bundle_index is not None and faiss_k:
+            q_vec = embed_texts([query_rewrite], api_key)
+            if q_vec is not None:
+                q_emb = q_vec.astype("float32")
+                faiss.normalize_L2(q_emb)
+                _, I = bundle_index.search(q_emb, min(faiss_k, len(df)))
+                faiss_ids = [i for i in I[0].tolist() if i >= 0]
+                candidate_pool = np.unique(np.concatenate([candidate_pool, faiss_ids]))
         if len(candidate_pool) == 0:
             candidate_pool = np.arange(len(df))
         k = min(candidate_k, len(candidate_pool))
@@ -958,6 +1147,7 @@ if run:
                     "input_text": query,
                     "추출키워드": ", ".join(keywords) if keywords else "",
                     "검색쿼리": query_rewrite,
+                    "태그": row.get("tags", "") if "tags" in merged.columns else "",
                     "기업명": row["기업명"],
                     "R&D과제번호": row["R&D과제번호"],
                     "대표과제명": row["대표과제명"],
